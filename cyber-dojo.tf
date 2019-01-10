@@ -2,7 +2,7 @@ variable "aws_key_path" {default = ""}
 variable "aws_key_name" {default = ""}
 
 provider "aws" {
-  region     = "eu-central-1"
+  region     = "eu-west-2"
 }
 
 resource "aws_security_group_rule" "allow_http" {

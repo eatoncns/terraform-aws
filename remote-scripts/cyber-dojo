@@ -1,0 +1,296 @@
+#!/bin/sh
+# shellcheck disable=SC2039  # In POSIX sh, 'local' is undefined.
+
+# Controls a cyber-dojo web server.
+# The aim is for all commands to forward to and run inside
+# the cyber-dojo commander container.
+# However, four commands have to be handled locally,
+# on the host server, outside of the container, viz:
+#
+#  1) ./cyber-dojo sh ...
+#  2) ./cyber-dojo update ...
+#  3) ./cyber-dojo start-point create NAME --dir=DIR
+#  4) ./cyber-dojo start-point create NAME --list=FILE
+#
+#  1) provides an interactive terminal.
+#  2) ends by replacing this script.
+#  3) needs to volume mount DIR.
+#  4) needs to volume mount FILE
+#
+# requires: awk, curl, sed, grep which are
+# all in DockerToolbox Quickstart Terminal.
+#
+# Re 1: the docker run command could take --interactive --tty
+# options which should enable the sh command to be handled
+# by the commander container. Trying this out briefly shows
+# that it affects the captured output (trailing \r \n) which
+# breaks the sh tests.
+#
+# Re 3,4: If you're running Docker-Toolbox and are in the terminal
+# it will check the DIR/FILE __locally__ (eg on the Mac) but the
+# volume-mount will of course take place where the docker-daemon
+# is running, which will be on the default VM
+# (thanks to the DOCKER_HOST et al env-vars).
+# In this case ensure the DIR/FILE is under /Users/<user> so it
+# will be in the default VM so the volume mount will work.
+
+# - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
+
+readonly my_dir="$( cd "$( dirname "$0" )" && pwd )"
+readonly cyber_dojo_commander=cyberdojo/commander
+
+# - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
+
+exit_fail()
+{
+  if [ "$*" != '' ]; then
+    >&2 echo "FAILED: $*"
+  fi
+  exit 1
+}
+
+# - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
+
+delegate_to_commander()
+{
+  # The *.env file volume mounts are for files.
+  # The start-point volume mount is for a dir.
+  # Don't collapse the multiple *.env file volume mounts into a single
+  # dir volume mount. Do that and the *.env dir and the start-point
+  # dir could coincide and you get a [Duplicate mount point]
+  # error from the docker daemon.
+
+  if [ "$1" = 'up' ];  then
+    set_env_file_volumes
+  fi
+  if [ "$1" = 'start-point' ] && [ "$2" = 'create' ]; then
+    set_start_point_create_volume "$@"
+  fi
+
+  # shellcheck disable=SC2086
+  # 2086 == Double quote to prevent globbing and word splitting.
+  # CYBER_DOJO_ENV_ROOT must match Dockerfile
+  docker run \
+    --init \
+    --rm \
+    --user=root \
+    --env CYBER_DOJO_SH_ROOT="${my_dir}" \
+    --env CYBER_DOJO_ENV_ROOT=/tmp/app \
+    --volume=/var/run/docker.sock:/var/run/docker.sock \
+    ${volume_grafana_env_file} \
+    ${volume_nginx_env_file} \
+    ${volume_web_env_file} \
+    ${volume_zipper_env_file} \
+    ${volume_start_point_create} \
+      "${cyber_dojo_commander}" \
+        /app/cyber-dojo.rb ${debug_option} "$@"
+}
+
+# - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
+
+set_env_file_volumes()
+{
+  # web:env_file: in docker-compose.yml
+  local web_env="${my_dir}/web.env"
+  if [ -f "${web_env}" ];  then
+    volume_web_env_file="--volume=${web_env}:${web_env}:ro"
+  fi
+  # nginx:env_file: in docker-compose.yml
+  local nginx_env="${my_dir}/nginx.env"
+  if [ -f "${nginx_env}" ];  then
+    volume_nginx_env_file="--volume=${nginx_env}:${nginx_env}:ro"
+  fi
+  # grafana:env_file: in docker-compose.yml
+  local grafana_env="${my_dir}/grafana.env"
+  if [ -f "${grafana_env}" ];  then
+    volume_grafana_env_file="--volume=${grafana_env}:${grafana_env}:ro"
+  fi
+  # zipper:env_file: in docker-compose.yml
+  local zipper_env="${my_dir}/zipper.env"
+  if [ -f "${zipper_env}" ];  then
+    volume_zipper_env_file="--volume=${zipper_env}:${zipper_env}:ro"
+  fi
+}
+
+# - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
+
+set_start_point_create_volume()
+{
+  local lhs=$(echo "$4" | cut -f1 -s -d=)
+  local value=$(echo "$4" | cut -f2 -s -d=)
+
+  # --dir=DIR
+  if [ "${lhs}" = '--dir' ] && [ "${value}" != '' ] && [ "$5" = '' ]; then
+    if [ -d "${value}" ]; then
+      volume_start_point_create="--volume=${value}:${value}:ro"
+    else
+      exit_fail "dir ${value} does not exist"
+    fi
+  fi
+
+  # --list=LIST
+  if [ "${lhs}" = '--list' ] && [ "$5" = '' ]; then
+    local first_letter=$(printf %.1s "$value")
+    local file_prefix=$(printf %.7s "$value")
+    local file_suffix=${value#???????}
+    if [ "${first_letter}" = "/" ]; then
+      if [ -f "${value}" ]; then
+        volume_start_point_create="--volume=${value}:${value}:ro"
+      else
+        exit_fail "${value} does not exist"
+      fi
+    elif [ "${file_prefix}" = "file://" ]; then
+      if [ -f "${file_suffix}" ]; then
+        volume_start_point_create="--volume=${file_suffix}:${file_suffix}:ro"
+      else
+        exit_fail "${value} does not exist"
+      fi
+    else # network URL
+      if ! curl --output /dev/null --silent --head --fail "${value}"; then
+        exit_fail "${value} does not exist"
+      fi
+    fi # --list=file://
+  fi # --list
+}
+
+# - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
+
+handle_sh_locally()
+{
+  if [ "$1" != "sh" ]; then
+    return
+  fi
+
+  local arg=$2
+  local name=cyber-dojo-${arg}
+  if running_container "${name}"; then
+    echo "shelling into ${name}"
+    local cmd="export PS1='[cyber-dojo sh ${arg}] \\w $ ';sh"
+    docker exec --interactive --tty "${name}" sh -c "${cmd}"
+  elif [ "${arg}" != '--help' ] && [ "${arg}" != '' ]; then
+    exit_fail "${name} is not a running container"
+  fi
+}
+
+# - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
+
+running_container()
+{
+  local space='\s'
+  local name=$1
+  local end_of_line='$'
+  docker ps --filter "name=${name}" | grep "${space}${name}${end_of_line}" > /dev/null
+  return $?
+}
+
+# - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
+
+handle_update_locally()
+{
+  if [ "$1" != 'update' ]; then
+    return
+  fi
+
+  if [ "$2" = '' ]; then
+    replace_myself
+  fi
+  if [ "$2" = 'server' ] && [ "$3" = '' ]; then
+    replace_myself
+  fi
+}
+
+# - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
+
+replace_myself()
+{
+  # See https://bani.com.br/2013/04/shell-script-that-updates-itself/
+  local cid=$(docker create --interactive ${cyber_dojo_commander} sh)
+  docker cp "${cid}":/app/cyber-dojo /tmp
+  docker rm "${cid}" > /dev/null
+  local new_me=/tmp/cyber-dojo
+  chmod +x ${new_me}
+  cp ${new_me} "$0"
+  rm ${new_me}
+}
+
+# - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
+
+check_host_volume_mount_permissions()
+{
+  local service=${1}
+  local uid=${2}
+  local gid=${3}
+  local filename="owner-probe.txt"
+
+  # Note: the docker run with the volume-mount will
+  # create the named directory if it does not exist.
+  docker run \
+    --rm \
+    --user=${uid} \
+    --volume /cyber-dojo:/cyber-dojo:rw \
+    cyberdojo/${service} \
+    sh -c "echo Running to create volume"
+
+  sudo chown -R ${uid}:${gid} /cyber-dojo
+
+  docker run \
+    --rm \
+    --user=${uid} \
+    --volume /cyber-dojo:/cyber-dojo:rw \
+    cyberdojo/${service} \
+    sh -c "touch /cyber-dojo/${filename} >& /dev/null"
+
+  result=$?
+  if [ "${result}" != "0" ]; then
+    echo "  The ${service} service (uid=${uid}, gid=${gid}) requires ownership of /cyber-dojo"
+    echo
+    echo "  There was a problem when trying to verify the above"
+    exit_fail
+  else
+    # The docker-run-probe successfully created the
+    # probe-file. So remove it.
+    docker run \
+      --rm \
+      --user=${uid} \
+      --volume /cyber-dojo:/cyber-dojo:rw \
+      cyberdojo/${service} \
+      sh -c "rm /cyber-dojo/${filename}"
+  fi
+}
+
+#==========================================================
+
+if ! hash docker 2> /dev/null; then
+  echo 'docker is not installed'
+  echo 'See http://blog.cyber-dojo.org/2016/08/running-your-own-cyber-dojo-web-server.html'
+  exit_fail
+fi
+
+# - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
+
+if [ "$1" = '--debug' ]; then
+  debug_option='--debug'
+  shift
+fi
+
+# - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
+
+if [ "$1" = 'update' ]; then
+  if [ "$2" = '' ]; then
+    docker pull ${cyber_dojo_commander}
+  fi
+  if [ "$2" = 'server' ] && [ "$3" = '' ]; then
+    docker pull ${cyber_dojo_commander}
+  fi
+fi
+
+# - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
+
+check_host_volume_mount_permissions saver 19663 65533
+
+if ! delegate_to_commander "$@"; then
+  exit_fail
+fi
+
+handle_sh_locally "$@"
+handle_update_locally "$@"

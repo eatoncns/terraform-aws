@@ -1,6 +1,5 @@
 #/bin/bash
 set -e
 
-curl -O https://raw.githubusercontent.com/cyber-dojo/commander/master/cyber-dojo
-chmod +x cyber-dojo
-sudo ./cyber-dojo up
+chmod +x /tmp/remote-scripts/cyber-dojo
+sudo /tmp/remote-scripts/cyber-dojo up
