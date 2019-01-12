@@ -4,3 +4,4 @@ public_ips.txt
 *.backup
 terraform.tfvars
 terraform.tfstate
+.terraform/
